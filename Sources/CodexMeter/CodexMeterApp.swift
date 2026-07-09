@@ -1,0 +1,1401 @@
+import AppKit
+import AVFoundation
+import Combine
+import SwiftUI
+import UserNotifications
+
+@main
+struct CodexMeterApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        Settings {
+            EmptyView()
+        }
+    }
+}
+
+private enum PanelMetrics {
+    static let cardWidth: CGFloat = 360
+    static let cardHeight: CGFloat = 220
+    static let windowPadding: CGFloat = 14
+    static let width: CGFloat = cardWidth + windowPadding * 2
+    static let height: CGFloat = cardHeight + windowPadding * 2
+    static let verticalGap: CGFloat = 14
+    static let screenPadding: CGFloat = 8
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let quotaStore = QuotaStore()
+    private var statusItem: NSStatusItem?
+    private var statusView: CompactStatusItemView?
+    private var panelWindow: NSPanel?
+    private var outsideClickMonitor: Any?
+    private var snapshotCancellable: AnyCancellable?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        configureStatusItem()
+        configurePanelWindow()
+        configureWakeRefreshObservers()
+        quotaStore.start()
+
+        snapshotCancellable = quotaStore.$snapshot.sink { [weak self] snapshot in
+            self?.updateStatusItem(with: snapshot)
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        stopOutsideClickMonitor()
+    }
+
+    private func configureStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = item
+
+        let view = CompactStatusItemView()
+        view.onClick = { [weak self] in
+            self?.togglePanel()
+        }
+        item.view = view
+        statusView = view
+
+        updateStatusItem(with: quotaStore.snapshot)
+    }
+
+    private func configurePanelWindow() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: PanelMetrics.width, height: PanelMetrics.height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.hidesOnDeactivate = false
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.contentViewController = NSHostingController(
+            rootView: StatusPanelView(store: quotaStore)
+                .frame(width: PanelMetrics.width, height: PanelMetrics.height)
+        )
+        self.panelWindow = panel
+    }
+
+    private func configureWakeRefreshObservers() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(refreshAfterSleepOrUnlock),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(refreshAfterSleepOrUnlock),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(refreshAfterSleepOrUnlock),
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil
+        )
+    }
+
+    private func updateStatusItem(with snapshot: QuotaSnapshot) {
+        let title = snapshot.isUnavailable ? "未同步" : "\(snapshot.percentText) | \(snapshot.shortResetText)"
+        let tooltip = snapshot.isUnavailable ? "正在等待 Codex 会话额度数据" : "5h 额度剩余 \(snapshot.remainingPercent)% ，距离额度恢复 \(snapshot.resetText)"
+        statusView?.update(
+            title: title,
+            color: snapshot.tagTextColor,
+            backgroundColor: snapshot.tagBackgroundColor,
+            tooltip: tooltip
+        )
+        statusItem?.length = statusView?.frame.width ?? NSStatusItem.variableLength
+    }
+
+    private func togglePanel() {
+        guard let statusView, let panelWindow else { return }
+
+        if panelWindow.isVisible {
+            closePanel()
+        } else {
+            positionPanel(relativeTo: statusView)
+            panelWindow.orderFrontRegardless()
+            startOutsideClickMonitor()
+            quotaStore.refresh()
+        }
+    }
+
+    private func closePanel() {
+        panelWindow?.orderOut(nil)
+        stopOutsideClickMonitor()
+    }
+
+    private func positionPanel(relativeTo anchorView: NSView) {
+        guard let window = anchorView.window else { return }
+        let anchorRectInWindow = anchorView.convert(anchorView.bounds, to: nil)
+        let anchorRect = window.convertToScreen(anchorRectInWindow)
+        let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+        let proposedX = anchorRect.midX - PanelMetrics.width / 2
+        let x = min(
+            max(proposedX, visibleFrame.minX + PanelMetrics.screenPadding),
+            visibleFrame.maxX - PanelMetrics.width - PanelMetrics.screenPadding
+        )
+        let y = anchorRect.minY - PanelMetrics.height - PanelMetrics.verticalGap
+        panelWindow?.setFrame(
+            NSRect(x: x, y: y, width: PanelMetrics.width, height: PanelMetrics.height),
+            display: true
+        )
+    }
+
+    private func startOutsideClickMonitor() {
+        stopOutsideClickMonitor()
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            Task { @MainActor in
+                self?.closePanel()
+            }
+        }
+    }
+
+    private func stopOutsideClickMonitor() {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+    }
+
+    @objc private func refreshAfterSleepOrUnlock(_ notification: Notification) {
+        quotaStore.refresh()
+    }
+}
+
+final class CompactStatusItemView: NSView {
+    var onClick: (() -> Void)?
+
+    private let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+    private let horizontalPadding: CGFloat = 5
+    private var title = ""
+    private var color = NSColor.labelColor
+    private var backgroundColor = NSColor.clear
+
+    func update(title: String, color: NSColor, backgroundColor: NSColor, tooltip: String) {
+        self.title = title
+        self.color = color
+        self.backgroundColor = backgroundColor
+        self.toolTip = tooltip
+
+        let width = ceil(attributedTitle.size().width + horizontalPadding * 2)
+        frame = NSRect(x: 0, y: 0, width: width, height: NSStatusBar.system.thickness)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        let size = attributedTitle.size()
+        let tagRect = NSRect(
+            x: 0,
+            y: floor((bounds.height - 17) / 2),
+            width: bounds.width,
+            height: 17
+        )
+        backgroundColor.setFill()
+        NSBezierPath(roundedRect: tagRect, xRadius: 5, yRadius: 5).fill()
+
+        color.set()
+        let rect = NSRect(
+            x: horizontalPadding,
+            y: floor((bounds.height - size.height) / 2),
+            width: size.width,
+            height: size.height
+        )
+        attributedTitle.draw(in: rect)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onClick?()
+    }
+
+    private var attributedTitle: NSAttributedString {
+        NSAttributedString(
+            string: title,
+            attributes: [
+                .font: font,
+                .foregroundColor: color,
+                .kern: -0.2
+            ]
+        )
+    }
+}
+
+struct StatusPanelView: View {
+    @ObservedObject var store: QuotaStore
+
+    var body: some View {
+        ZStack {
+            ZStack {
+                PanelGlassBackground()
+
+                VStack(alignment: .leading, spacing: 12) {
+                    header
+                    quotaOverview
+                }
+                .padding(18)
+            }
+            .frame(width: PanelMetrics.cardWidth, height: PanelMetrics.cardHeight)
+            .padding(PanelMetrics.windowPadding)
+        }
+        .frame(width: PanelMetrics.width, height: PanelMetrics.height)
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text("\(store.snapshot.sourceName) · \(store.snapshot.lastUpdatedText)")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(store.snapshot.isUnavailable ? .red : .secondary)
+                .lineLimit(1)
+
+            Spacer()
+
+            RefreshIconButton {
+                store.refresh()
+            }
+
+            MoreActionsMenu(store: store)
+        }
+    }
+
+    private var quotaOverview: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(store.snapshot.percentText)
+                        .font(.system(size: 44, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                    Text("5 小时剩余")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(store.snapshot.shortResetText)
+                        .font(.system(size: 23, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                    Text(store.snapshot.resetClockText)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            QuotaProgressBar(percent: store.snapshot.displayRemainingPercent, tint: store.snapshot.tint)
+
+            Divider()
+                .padding(.vertical, 1)
+
+            SecondaryQuotaRow(
+                title: "周额度",
+                percentText: store.snapshot.weeklyPercentText,
+                trailing: store.snapshot.weeklyResetDateText
+            )
+        }
+        .padding(14)
+        .notificationInsetSurface(cornerRadius: 12)
+    }
+
+}
+
+struct PanelGlassBackground: View {
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
+
+        ZStack {
+            shape
+                .fill(.ultraThinMaterial)
+
+            shape
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.64),
+                            Color(red: 0.82, green: 0.94, blue: 1.0).opacity(0.48),
+                            Color.white.opacity(0.30)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+
+            Ellipse()
+                .fill(
+                    RadialGradient(
+                        colors: [
+                            Color.white.opacity(0.84),
+                            Color(red: 0.90, green: 0.98, blue: 1.0).opacity(0.32),
+                            Color.clear
+                        ],
+                        center: .center,
+                        startRadius: 4,
+                        endRadius: 82
+                    )
+                )
+                .frame(width: 130, height: 150)
+                .offset(x: 130, y: -56)
+                .blur(radius: 4)
+
+            shape
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.68),
+                            Color.white.opacity(0.38),
+                            Color(red: 0.42, green: 0.70, blue: 0.88).opacity(0.20)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+
+            shape
+                .stroke(Color.white.opacity(0.22), lineWidth: 0.7)
+                .padding(1.2)
+        }
+        .clipShape(shape)
+        .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
+    }
+}
+
+private extension View {
+    func notificationInsetSurface(cornerRadius: CGFloat) -> some View {
+        background {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color.white.opacity(0.28))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .stroke(Color.white.opacity(0.28), lineWidth: 0.8)
+        )
+    }
+
+    func glassSurface(cornerRadius: CGFloat) -> some View {
+        background {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.12),
+                            Color.white.opacity(0.028),
+                            Color.white.opacity(0.006)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.20),
+                            Color.white.opacity(0.05),
+                            Color.white.opacity(0.012)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+        )
+    }
+
+    func glassIconSurface(cornerRadius: CGFloat = 4, isPressed: Bool = false, isHovered: Bool = false) -> some View {
+        background {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(isPressed ? 0.12 : (isHovered ? 0.54 : 0.40)),
+                            Color.white.opacity(isPressed ? 0.04 : (isHovered ? 0.24 : 0.15)),
+                            Color.black.opacity(isPressed ? 0.14 : 0.05)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .stroke(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(isPressed ? 0.22 : (isHovered ? 0.68 : 0.52)),
+                            Color.white.opacity(isPressed ? 0.10 : (isHovered ? 0.42 : 0.30)),
+                            Color.black.opacity(isPressed ? 0.20 : 0.08)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius - 1, style: .continuous)
+                .stroke(Color.white.opacity(isPressed ? 0.04 : 0.10), lineWidth: 0.6)
+                .padding(1.25)
+        )
+        .shadow(color: Color.white.opacity(isPressed ? 0.04 : (isHovered ? 0.16 : 0.08)), radius: 0, x: 0, y: -0.6)
+        .shadow(color: Color.black.opacity(isPressed ? 0.06 : (isHovered ? 0.13 : 0.10)), radius: isPressed ? 1 : (isHovered ? 3 : 2), x: 0, y: isPressed ? 0.4 : (isHovered ? 1.6 : 1.2))
+        .shadow(color: Color.black.opacity(isPressed ? 0.03 : (isHovered ? 0.07 : 0.05)), radius: isPressed ? 1 : (isHovered ? 5 : 3), x: 0, y: isPressed ? 0.8 : (isHovered ? 3 : 2))
+        .offset(y: isPressed ? 0.75 : (isHovered ? -0.6 : 0))
+        .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+
+}
+
+struct RefreshIconButton: View {
+    let action: () -> Void
+    @State private var isPressed = false
+    @State private var isHovered = false
+
+    var body: some View {
+        Button {
+            action()
+        } label: {
+            PanelIconFrame(systemImage: "arrow.clockwise", isPressed: isPressed, isHovered: isHovered)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.08)) {
+                isHovered = hovering
+            }
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    if isPressed == false {
+                        withAnimation(.easeOut(duration: 0.035)) {
+                            isPressed = true
+                        }
+                    }
+                }
+                .onEnded { _ in
+                    withAnimation(.spring(response: 0.12, dampingFraction: 0.72)) {
+                        isPressed = false
+                    }
+                }
+        )
+        .help("刷新")
+    }
+}
+
+struct PanelIconFrame: View {
+    let systemImage: String
+    var isPressed = false
+    var isHovered = false
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 12, weight: .semibold))
+            .frame(width: 24, height: 24)
+            .contentShape(Rectangle())
+            .foregroundStyle(.secondary)
+            .glassIconSurface(isPressed: isPressed, isHovered: isHovered)
+    }
+}
+
+struct MoreActionsMenu: View {
+    @ObservedObject var store: QuotaStore
+    @State private var isShowingActions = false
+    @State private var isPressed = false
+    @State private var isHovered = false
+    
+    var body: some View {
+        Button {
+            isShowingActions.toggle()
+        } label: {
+            PanelIconFrame(systemImage: "ellipsis", isPressed: isPressed || isShowingActions, isHovered: isHovered || isShowingActions)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.08)) {
+                isHovered = hovering
+            }
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    if isPressed == false {
+                        withAnimation(.easeOut(duration: 0.035)) {
+                            isPressed = true
+                        }
+                    }
+                }
+                .onEnded { _ in
+                    withAnimation(.spring(response: 0.12, dampingFraction: 0.72)) {
+                        isPressed = false
+                    }
+                }
+        )
+        .popover(isPresented: $isShowingActions, arrowEdge: .top) {
+            ActionsPopover(store: store)
+                .frame(width: 224)
+        }
+        .help("更多")
+    }
+}
+
+struct ActionsPopover: View {
+    @ObservedObject var store: QuotaStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                store.toggleVoiceBroadcast()
+            } label: {
+                ActionMenuRow(
+                    systemImage: store.voiceBroadcastEnabled ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                    title: store.voiceBroadcastEnabled ? "关闭播报" : "开启播报",
+                    trailing: store.voiceBroadcastEnabled ? nil : "\(store.voiceBroadcastIntervalMinutes) 分钟"
+                )
+            }
+            .buttonStyle(.plain)
+
+            if store.voiceBroadcastEnabled {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("播报间隔")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+
+                    BroadcastIntervalButton(minutes: 1, store: store)
+                    BroadcastIntervalButton(minutes: 5, store: store)
+                    BroadcastIntervalButton(minutes: 10, store: store)
+                }
+            }
+
+            Divider()
+
+            Button {
+                NSApplication.shared.terminate(nil)
+            } label: {
+                ActionMenuRow(systemImage: "power", title: "退出应用", trailing: nil)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(10)
+        .background(PanelGlassBackground())
+    }
+}
+
+struct BroadcastIntervalButton: View {
+    let minutes: Int
+    @ObservedObject var store: QuotaStore
+
+    var body: some View {
+        Button {
+            store.setVoiceBroadcastInterval(minutes: minutes)
+        } label: {
+            ActionMenuRow(
+                systemImage: store.voiceBroadcastIntervalMinutes == minutes ? "checkmark.circle.fill" : "circle",
+                title: "\(minutes) 分钟",
+                trailing: nil
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ActionMenuRow: View {
+    let systemImage: String
+    let title: String
+    let trailing: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 18)
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            if let trailing {
+                Text(trailing)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .foregroundStyle(.primary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .contentShape(Rectangle())
+        .glassSurface(cornerRadius: 6)
+    }
+}
+
+struct QuotaProgressBar: View {
+    let percent: Int
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(.thinMaterial)
+                    .overlay(Color(nsColor: .separatorColor).opacity(0.16))
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                tint.opacity(0.78),
+                                tint
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: max(8, proxy.size.width * min(max(Double(percent) / 100, 0), 1)))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .stroke(Color.white.opacity(0.24), lineWidth: 0.6)
+                    )
+            }
+        }
+        .frame(height: 8)
+    }
+}
+
+struct SecondaryQuotaRow: View {
+    let title: String
+    let percentText: String
+    let trailing: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(percentText)
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(trailing)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 86, alignment: .trailing)
+        }
+    }
+}
+
+@MainActor
+final class QuotaStore: ObservableObject {
+    @Published var snapshot: QuotaSnapshot
+    @Published var voiceBroadcastEnabled = false
+    @Published var voiceBroadcastIntervalMinutes: Int
+
+    private var timer: Timer?
+    private var voiceTimer: Timer?
+    private var isRefreshing = false
+    private var speakAfterRefresh = false
+    private let refreshQueue = DispatchQueue(label: "com.codexmeter.refresh", qos: .utility)
+    private let speechSynthesizer = AVSpeechSynthesizer()
+    private var notifiedLevels = Set<Int>()
+    private let provider: QuotaProvider
+
+    init(provider: QuotaProvider = CompositeQuotaProvider()) {
+        self.provider = provider
+        self.snapshot = QuotaSnapshot.unavailable()
+        let savedInterval = UserDefaults.standard.integer(forKey: CacheKey.voiceBroadcastIntervalMinutes)
+        self.voiceBroadcastIntervalMinutes = Self.allowedVoiceBroadcastIntervals.contains(savedInterval) ? savedInterval : 1
+    }
+
+    func start() {
+        refresh()
+        requestNotificationPermission()
+        guard timer == nil else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refresh()
+            }
+        }
+    }
+
+    func refresh() {
+        guard isRefreshing == false else { return }
+        isRefreshing = true
+        let provider = provider
+
+        refreshQueue.async { [weak self] in
+            let liveSnapshot = provider.currentSnapshot()
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let shouldSpeak = self.speakAfterRefresh
+                self.speakAfterRefresh = false
+                if let liveSnapshot {
+                    self.snapshot = liveSnapshot
+                    liveSnapshot.cache()
+                } else {
+                    self.snapshot = .unavailable()
+                }
+                self.isRefreshing = false
+                self.evaluateNotifications()
+                if shouldSpeak, self.voiceBroadcastEnabled {
+                    self.speak(self.snapshot)
+                }
+            }
+        }
+    }
+
+    func toggleVoiceBroadcast() {
+        if voiceBroadcastEnabled {
+            stopVoiceBroadcast()
+        } else {
+            startVoiceBroadcast()
+        }
+    }
+
+    private func startVoiceBroadcast() {
+        voiceBroadcastEnabled = true
+        requestVoiceBroadcast()
+        scheduleVoiceTimer()
+    }
+
+    private func scheduleVoiceTimer() {
+        voiceTimer?.invalidate()
+        voiceTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(voiceBroadcastIntervalMinutes * 60), repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.requestVoiceBroadcast()
+            }
+        }
+    }
+
+    private func stopVoiceBroadcast() {
+        voiceBroadcastEnabled = false
+        speakAfterRefresh = false
+        voiceTimer?.invalidate()
+        voiceTimer = nil
+        speechSynthesizer.stopSpeaking(at: .immediate)
+    }
+
+    func setVoiceBroadcastInterval(minutes: Int) {
+        guard Self.allowedVoiceBroadcastIntervals.contains(minutes) else { return }
+        voiceBroadcastIntervalMinutes = minutes
+        UserDefaults.standard.set(minutes, forKey: CacheKey.voiceBroadcastIntervalMinutes)
+        if voiceBroadcastEnabled {
+            scheduleVoiceTimer()
+        }
+    }
+
+    private func requestVoiceBroadcast() {
+        speakAfterRefresh = true
+        refresh()
+    }
+
+    private func speak(_ snapshot: QuotaSnapshot) {
+        guard !snapshot.isUnavailable else { return }
+        let text = "Codex 五小时额度剩余 \(snapshot.remainingPercent)%，距离额度恢复 \(snapshot.resetText)。"
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+        utterance.rate = 0.48
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        speechSynthesizer.speak(utterance)
+    }
+
+    private func evaluateNotifications() {
+        guard !snapshot.isUnavailable else { return }
+        let remaining = snapshot.remainingPercent
+
+        if remaining <= 10 {
+            notifyOnce(level: 10, title: "Codex 额度接近耗尽", body: "当前 5h 剩余 \(remaining)%，建议放慢高消耗任务。")
+        } else if remaining <= 20 {
+            notifyOnce(level: 20, title: "Codex 额度偏低", body: "当前 5h 剩余 \(remaining)%，距离额度恢复 \(snapshot.resetText)。")
+        }
+    }
+
+    private func notifyOnce(level: Int, title: String, body: String) {
+        guard notifiedLevels.insert(level).inserted else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "codex-meter-\(level)-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private static let allowedVoiceBroadcastIntervals = [1, 5, 10]
+}
+
+protocol QuotaProvider: Sendable {
+    func currentSnapshot() -> QuotaSnapshot?
+}
+
+struct CompositeQuotaProvider: QuotaProvider {
+    private let logProvider = CodexLogQuotaProvider()
+    private let realProvider = CodexSessionQuotaProvider()
+
+    func currentSnapshot() -> QuotaSnapshot? {
+        logProvider.currentSnapshot() ?? realProvider.currentSnapshot()
+    }
+}
+
+struct CodexLogQuotaProvider {
+    func currentSnapshot() -> QuotaSnapshot? {
+        guard let record = newestHeaderRateLimitRecord() else {
+            return nil
+        }
+
+        let now = Date()
+        let primaryUsed = Self.percent(record.primary.usedPercent)
+        let weeklyUsed = Self.percent(record.secondary.usedPercent)
+        return QuotaSnapshot(
+            remainingPercent: max(0, min(100, 100 - primaryUsed)),
+            weeklyRemainingPercent: max(0, min(100, 100 - weeklyUsed)),
+            resetDate: Date(timeIntervalSince1970: record.primary.resetsAt),
+            weeklyResetDate: Date(timeIntervalSince1970: record.secondary.resetsAt),
+            lastUpdated: now,
+            sourceName: "Codex 日志",
+            isUnavailable: false
+        )
+    }
+
+    private func newestHeaderRateLimitRecord() -> RateLimitRecord? {
+        let databaseURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/logs_2.sqlite")
+        guard FileManager.default.fileExists(atPath: databaseURL.path) else {
+            return nil
+        }
+
+        let query = """
+        select ts || char(9) || feedback_log_body from logs
+        where feedback_log_body like '%x-codex-primary-used-percent%'
+        order by ts desc, ts_nanos desc, id desc
+        limit 1;
+        """
+        guard let output = runSQLite(databasePath: databaseURL.path, query: query) else {
+            return nil
+        }
+
+        let parts = output.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let timestamp = TimeInterval(parts[0]),
+              let primaryUsed = Self.headerDouble("x-codex-primary-used-percent", in: String(parts[1])),
+              let weeklyUsed = Self.headerDouble("x-codex-secondary-used-percent", in: String(parts[1])),
+              let primaryResetAt = Self.headerDouble("x-codex-primary-reset-at", in: String(parts[1])),
+              let weeklyResetAt = Self.headerDouble("x-codex-secondary-reset-at", in: String(parts[1])),
+              let primaryWindowMinutes = Self.headerInt("x-codex-primary-window-minutes", in: String(parts[1])),
+              let weeklyWindowMinutes = Self.headerInt("x-codex-secondary-window-minutes", in: String(parts[1])) else {
+            return nil
+        }
+
+        let now = Date().timeIntervalSince1970
+        guard primaryResetAt > now, weeklyResetAt > now else {
+            return nil
+        }
+
+        return RateLimitRecord(
+            timestamp: Date(timeIntervalSince1970: timestamp),
+            fileModifiedAt: Date(timeIntervalSince1970: timestamp),
+            primary: RateLimitWindow(
+                usedPercent: primaryUsed,
+                resetsAt: primaryResetAt,
+                windowMinutes: primaryWindowMinutes
+            ),
+            secondary: RateLimitWindow(
+                usedPercent: weeklyUsed,
+                resetsAt: weeklyResetAt,
+                windowMinutes: weeklyWindowMinutes
+            )
+        )
+    }
+
+    private func runSQLite(databasePath: String, query: String) -> String? {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = ["-readonly", databasePath, query]
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func headerDouble(_ name: String, in text: String) -> Double? {
+        guard let value = headerValue(name, in: text) else { return nil }
+        return Double(value)
+    }
+
+    private static func headerInt(_ name: String, in text: String) -> Int? {
+        guard let value = headerValue(name, in: text) else { return nil }
+        return Int(value)
+    }
+
+    private static func headerValue(_ name: String, in text: String) -> String? {
+        let marker = "\"\(name)\": \""
+        guard let markerRange = text.range(of: marker) else {
+            return nil
+        }
+        let valueStart = markerRange.upperBound
+        guard let valueEnd = text[valueStart...].firstIndex(of: "\"") else {
+            return nil
+        }
+        return String(text[valueStart..<valueEnd])
+    }
+
+    private static func percent(_ value: Double) -> Int {
+        Int(value.rounded())
+    }
+}
+
+struct CodexSessionQuotaProvider {
+    func currentSnapshot() -> QuotaSnapshot? {
+        guard let record = newestRateLimitRecord() else {
+            return nil
+        }
+
+        let now = Date()
+        let primaryUsed = Self.percent(record.primary.usedPercent)
+        let weeklyUsed = Self.percent(record.secondary.usedPercent)
+        let primaryRemaining = max(0, min(100, 100 - primaryUsed))
+        let weeklyRemaining = max(0, min(100, 100 - weeklyUsed))
+
+        return QuotaSnapshot(
+            remainingPercent: primaryRemaining,
+            weeklyRemainingPercent: weeklyRemaining,
+            resetDate: Date(timeIntervalSince1970: record.primary.resetsAt),
+            weeklyResetDate: Date(timeIntervalSince1970: record.secondary.resetsAt),
+            lastUpdated: now,
+            sourceName: "Codex 会话",
+            isUnavailable: false
+        )
+    }
+
+    private func newestRateLimitRecord() -> RateLimitRecord? {
+        let roots = [
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
+        ]
+
+        let files = roots.flatMap { recentJSONLFiles(under: $0) }
+            .sorted { $0.modifiedAt > $1.modifiedAt }
+            .prefix(80)
+
+        var records: [RateLimitRecord] = []
+        for file in files {
+            records.append(contentsOf: rateLimitRecords(in: file.url, fileModifiedAt: file.modifiedAt))
+            if let newestRecord = records.map(\.sortDate).max(),
+               Date().timeIntervalSince(newestRecord) < 15 * 60,
+               file.modifiedAt < newestRecord.addingTimeInterval(-15 * 60) {
+                break
+            }
+        }
+
+        return bestRateLimitRecord(from: records)
+    }
+
+    private func recentJSONLFiles(under root: URL) -> [SessionFile] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var files: [SessionFile] = []
+        for case let url as URL in enumerator {
+            guard url.pathExtension == "jsonl" else { continue }
+            guard let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let modifiedAt = values.contentModificationDate else {
+                continue
+            }
+            files.append(SessionFile(url: url, modifiedAt: modifiedAt))
+        }
+        return files
+    }
+
+    private func rateLimitRecords(in url: URL, fileModifiedAt: Date) -> [RateLimitRecord] {
+        guard let text = readTailText(from: url) else {
+            return []
+        }
+
+        var records: [RateLimitRecord] = []
+        for line in text.split(separator: "\n").reversed() {
+            guard line.contains("\"rate_limits\"") else { continue }
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let payload = object["payload"] as? [String: Any],
+                  let rateLimits = payload["rate_limits"] as? [String: Any],
+                  Self.isAggregateCodexLimit(rateLimits),
+                  let primary = parseWindow(rateLimits["primary"]),
+                  let secondary = parseWindow(rateLimits["secondary"]),
+                  primary.windowMinutes == 300,
+                  secondary.windowMinutes == 10_080 else {
+                continue
+            }
+
+            records.append(
+                RateLimitRecord(
+                    timestamp: parseDate(object["timestamp"] as? String),
+                    fileModifiedAt: fileModifiedAt,
+                    primary: primary,
+                    secondary: secondary
+                )
+            )
+            if records.count >= 40 {
+                break
+            }
+        }
+
+        return records
+    }
+
+    private func bestRateLimitRecord(from records: [RateLimitRecord]) -> RateLimitRecord? {
+        let now = Date().timeIntervalSince1970
+        let currentWindowRecords = records.filter { record in
+            record.primary.resetsAt > now && record.secondary.resetsAt > now
+        }
+
+        return currentWindowRecords.max { lhs, rhs in
+            lhs.sortDate < rhs.sortDate
+        }
+    }
+
+    private func readTailText(from url: URL, maxBytes: UInt64 = 4 * 1024 * 1024) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return nil
+        }
+        defer {
+            try? handle.close()
+        }
+
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        let offset = fileSize > maxBytes ? fileSize - maxBytes : 0
+        try? handle.seek(toOffset: offset)
+
+        guard let data = try? handle.readToEnd() else {
+            return nil
+        }
+
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func parseWindow(_ value: Any?) -> RateLimitWindow? {
+        guard let dictionary = value as? [String: Any],
+              let usedPercent = Self.double(dictionary["used_percent"]),
+              let resetsAt = Self.double(dictionary["resets_at"]) else {
+            return nil
+        }
+        return RateLimitWindow(
+            usedPercent: usedPercent,
+            resetsAt: resetsAt,
+            windowMinutes: Self.int(dictionary["window_minutes"])
+        )
+    }
+
+    private func parseDate(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        let fractionalFormatter = ISO8601DateFormatter()
+        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractionalFormatter.date(from: value) {
+            return date
+        }
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+
+    private static func percent(_ value: Double) -> Int {
+        Int(value.rounded())
+    }
+
+    private static func isAggregateCodexLimit(_ rateLimits: [String: Any]) -> Bool {
+        (rateLimits["limit_id"] as? String) == "codex"
+    }
+
+    private static func double(_ value: Any?) -> Double? {
+        if let double = value as? Double {
+            return double
+        }
+        if let int = value as? Int {
+            return Double(int)
+        }
+        if let string = value as? String {
+            return Double(string)
+        }
+        return nil
+    }
+
+    private static func int(_ value: Any?) -> Int? {
+        if let int = value as? Int {
+            return int
+        }
+        if let double = value as? Double {
+            return Int(double)
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
+    }
+}
+
+private struct SessionFile {
+    let url: URL
+    let modifiedAt: Date
+}
+
+private struct RateLimitRecord {
+    let timestamp: Date?
+    let fileModifiedAt: Date
+    let primary: RateLimitWindow
+    let secondary: RateLimitWindow
+
+    var sortDate: Date {
+        timestamp ?? fileModifiedAt
+    }
+}
+
+private struct RateLimitWindow {
+    let usedPercent: Double
+    let resetsAt: Double
+    let windowMinutes: Int?
+}
+
+struct QuotaSnapshot {
+    var remainingPercent: Int
+    var weeklyRemainingPercent: Int
+    var resetDate: Date
+    var weeklyResetDate: Date
+    var lastUpdated: Date
+    var sourceName: String
+    var isUnavailable: Bool
+
+    var percentText: String {
+        isUnavailable ? "—" : "\(remainingPercent)%"
+    }
+
+    var weeklyPercentText: String {
+        isUnavailable ? "—" : "\(weeklyRemainingPercent)%"
+    }
+
+    var displayRemainingPercent: Int {
+        isUnavailable ? 0 : remainingPercent
+    }
+
+    var usedPercent: Int {
+        100 - remainingPercent
+    }
+
+    var weeklyUsedPercent: Int {
+        100 - weeklyRemainingPercent
+    }
+
+    static func cached() -> QuotaSnapshot? {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: CacheKey.remainingPercent) != nil else {
+            return nil
+        }
+
+        return QuotaSnapshot(
+            remainingPercent: defaults.integer(forKey: CacheKey.remainingPercent),
+            weeklyRemainingPercent: defaults.integer(forKey: CacheKey.weeklyRemainingPercent),
+            resetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.resetDate)),
+            weeklyResetDate: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.weeklyResetDate)),
+            lastUpdated: Date(timeIntervalSince1970: defaults.double(forKey: CacheKey.lastUpdated)),
+            sourceName: "本机缓存",
+            isUnavailable: false
+        )
+    }
+
+    func cache() {
+        guard !isUnavailable else { return }
+
+        let defaults = UserDefaults.standard
+        defaults.set(remainingPercent, forKey: CacheKey.remainingPercent)
+        defaults.set(weeklyRemainingPercent, forKey: CacheKey.weeklyRemainingPercent)
+        defaults.set(resetDate.timeIntervalSince1970, forKey: CacheKey.resetDate)
+        defaults.set(weeklyResetDate.timeIntervalSince1970, forKey: CacheKey.weeklyResetDate)
+        defaults.set(lastUpdated.timeIntervalSince1970, forKey: CacheKey.lastUpdated)
+    }
+
+    var tint: Color {
+        guard !isUnavailable else { return .secondary }
+        return Self.tint(for: remainingPercent)
+    }
+
+    var tagBackgroundColor: NSColor {
+        guard !isUnavailable else { return NSColor(calibratedWhite: 1, alpha: 0.36) }
+        return Self.tagBackgroundColor(for: remainingPercent)
+    }
+
+    var tagTextColor: NSColor {
+        guard !isUnavailable else { return .labelColor }
+        return Self.tagTextColor(for: remainingPercent)
+    }
+
+    var weeklyTint: Color {
+        Self.tint(for: weeklyRemainingPercent)
+    }
+
+    private static func tint(for percent: Int) -> Color {
+        switch percent {
+        case 0...20:
+            return .red
+        case 21...45:
+            return .yellow
+        default:
+            return .green
+        }
+    }
+
+    private static func tagBackgroundColor(for percent: Int) -> NSColor {
+        switch percent {
+        case 0...20:
+            return NSColor(calibratedRed: 1.0, green: 0.784, blue: 0.780, alpha: 0.92)
+        case 21...45:
+            return NSColor(calibratedRed: 0.973, green: 0.910, blue: 0.714, alpha: 0.92)
+        default:
+            return NSColor(calibratedRed: 0.722, green: 0.953, blue: 0.820, alpha: 0.92)
+        }
+    }
+
+    private static func tagTextColor(for percent: Int) -> NSColor {
+        switch percent {
+        case 0...20:
+            return NSColor(calibratedRed: 0.290, green: 0.071, blue: 0.075, alpha: 1)
+        case 21...45:
+            return NSColor(calibratedRed: 0.227, green: 0.176, blue: 0.043, alpha: 1)
+        default:
+            return NSColor(calibratedRed: 0.063, green: 0.247, blue: 0.157, alpha: 1)
+        }
+    }
+
+    var resetText: String {
+        guard !isUnavailable else { return "暂无重置信息" }
+        return relativeResetText(for: resetDate)
+    }
+
+    var shortResetText: String {
+        guard !isUnavailable else { return "—" }
+        return compactResetText(for: resetDate)
+    }
+
+    var resetClockText: String {
+        guard !isUnavailable else { return "未同步" }
+        return resetDate.formatted(date: .omitted, time: .shortened)
+    }
+
+    var lastUpdatedText: String {
+        guard !isUnavailable else { return "未同步" }
+        return "更新于 \(lastUpdated.formatted(date: .omitted, time: .shortened))"
+    }
+
+    var weeklyResetDateText: String {
+        guard !isUnavailable else { return "—" }
+        let dateText = weeklyResetDate.formatted(
+            Date.FormatStyle()
+                .month(.wide)
+                .day(.defaultDigits)
+                .locale(Locale(identifier: "zh_CN"))
+        )
+        return "\(dateText)恢复"
+    }
+
+    private func relativeResetText(for date: Date) -> String {
+        let seconds = max(Int(date.timeIntervalSinceNow), 0)
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        if days > 0 {
+            return "\(days)天\(hours)小时后"
+        }
+        if hours > 0 {
+            return "\(hours)小时\(minutes)分后"
+        }
+        return "\(minutes)分后"
+    }
+
+    private func compactResetText(for date: Date) -> String {
+        let seconds = max(Int(date.timeIntervalSinceNow), 0)
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        if days > 0 {
+            return "\(days)d\(hours)h"
+        }
+        if hours > 0 {
+            return "\(hours)h\(minutes)m"
+        }
+        return "\(minutes)m"
+    }
+
+    static func unavailable() -> QuotaSnapshot {
+        let now = Date()
+        return QuotaSnapshot(
+            remainingPercent: 0,
+            weeklyRemainingPercent: 0,
+            resetDate: now,
+            weeklyResetDate: now,
+            lastUpdated: now,
+            sourceName: "额度未获取",
+            isUnavailable: true
+        )
+    }
+
+}
+
+private enum CacheKey {
+    static let remainingPercent = "quota.remainingPercent"
+    static let weeklyRemainingPercent = "quota.weeklyRemainingPercent"
+    static let resetDate = "quota.resetDate"
+    static let weeklyResetDate = "quota.weeklyResetDate"
+    static let lastUpdated = "quota.lastUpdated"
+    static let voiceBroadcastIntervalMinutes = "voiceBroadcast.intervalMinutes"
+}
